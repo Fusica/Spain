@@ -1,0 +1,936 @@
+//
+//  VocabularyViews.swift
+//  Spain
+//
+//  Created by Max on 1/6/26.
+//
+
+import SwiftUI
+
+private enum MasteryFilter: String, CaseIterable, Identifiable {
+    case all
+    case notStarted
+    case learning
+    case fuzzy
+    case familiar
+    case mastered
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all:
+            return "全部"
+        case .notStarted:
+            return "未开始"
+        case .learning:
+            return "初记"
+        case .fuzzy:
+            return "模糊"
+        case .familiar:
+            return "熟悉"
+        case .mastered:
+            return "掌握"
+        }
+    }
+
+    func matches(_ word: WordEntry) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .notStarted:
+            return word.masteryStatus == .notStarted
+        case .learning:
+            return word.masteryStatus == .learning
+        case .fuzzy:
+            return word.masteryStatus == .fuzzy
+        case .familiar:
+            return word.masteryStatus == .familiar
+        case .mastered:
+            return word.masteryStatus == .mastered
+        }
+    }
+}
+
+struct VocabularyListView: View {
+    @EnvironmentObject private var store: StudyStore
+    @State private var isPresentingAdd = false
+    @State private var searchText = ""
+    @State private var statusFilter: MasteryFilter = .all
+
+    private var sortedWords: [WordEntry] {
+        store.words.sorted {
+            if $0.nextReviewDate == $1.nextReviewDate {
+                return $0.createdAt > $1.createdAt
+            }
+            return $0.nextReviewDate < $1.nextReviewDate
+        }
+    }
+
+    private var filteredWords: [WordEntry] {
+        let key = searchText.normalizedAnswer
+        let candidates = sortedWords.filter { statusFilter.matches($0) }
+        guard !key.isEmpty else { return candidates }
+        return candidates.filter { $0.matchesSearchKey(key) }
+    }
+
+    private func count(for filter: MasteryFilter) -> Int {
+        sortedWords.filter { filter.matches($0) }.count
+    }
+
+    private func filterLabel(for filter: MasteryFilter) -> String {
+        let base = filter.title
+        if statusFilter == filter {
+            return "\(base) \(count(for: filter))"
+        }
+        return base
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if store.words.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "text.book.closed")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.secondary)
+                        Text("还没有生词，先添加几个吧。")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(.systemGroupedBackground))
+                } else {
+                    List {
+                        Section {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(MasteryFilter.allCases) { filter in
+                                        let isSelected = statusFilter == filter
+                                        Button {
+                                            statusFilter = filter
+                                        } label: {
+                                            Text(filterLabel(for: filter))
+                                                .font(.caption)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 6)
+                                                .background(isSelected ? Color.blue.opacity(0.15) : Color(.secondarySystemFill))
+                                                .foregroundStyle(isSelected ? .blue : .secondary)
+                                                .clipShape(Capsule())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 2)
+                            }
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                            .listRowSeparator(.hidden)
+                        }
+
+                        if filteredWords.isEmpty {
+                            Text("没有匹配结果。")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(filteredWords) { word in
+                                NavigationLink {
+                                    WordDetailView(wordID: word.id)
+                                } label: {
+                                    WordRowView(word: word)
+                                }
+                            }
+                            .onDelete { offsets in
+                                let ids = offsets.map { filteredWords[$0].id }
+                                store.removeWords(ids: ids)
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("词汇 \(store.words.count)")
+            .searchable(text: $searchText, prompt: "搜索西班牙语、变形或释义")
+            .overlay(alignment: .bottomTrailing) {
+                Button {
+                    isPresentingAdd = true
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 60, height: 60)
+                        Image(systemName: "plus")
+                            .font(.system(size: 45, weight: .regular))
+                            .foregroundStyle(.yellow)
+                    }
+                    .shadow(color: .black.opacity(0.2), radius: 8, x: 0, y: 4)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 24)
+                }
+                .accessibilityLabel("新增生词")
+            }
+            .sheet(isPresented: $isPresentingAdd) {
+                AddWordView()
+            }
+        }
+    }
+}
+
+private struct WordRowView: View {
+    let word: WordEntry
+
+    private var dueLabel: String {
+        if word.nextReviewDate <= Date() {
+            return "待复习"
+        }
+        return DateFormatters.shortDateTime.string(from: word.nextReviewDate)
+    }
+
+    var body: some View {
+        let status = word.masteryStatus
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(word.spanish)
+                    .font(.headline)
+                if word.partOfSpeech != .other {
+                    Text(word.partOfSpeechLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(status.rawValue)
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(statusColor(status).opacity(0.15))
+                    .foregroundStyle(statusColor(status))
+                    .clipShape(Capsule())
+            }
+            MeaningText(text: word.meaningText, language: word.meaningLanguage, style: .body)
+                .foregroundStyle(.secondary)
+            Text("下次复习：\(dueLabel)")
+                .font(.caption)
+                .foregroundStyle(word.nextReviewDate <= Date() ? .orange : .secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func statusColor(_ status: MasteryStatus) -> Color {
+        switch status {
+        case .notStarted:
+            return .gray
+        case .learning:
+            return .red
+        case .familiar:
+            return .blue
+        case .mastered:
+            return .green
+        case .fuzzy:
+            return .orange
+        }
+    }
+}
+
+struct WordDetailView: View {
+    @EnvironmentObject private var store: StudyStore
+    let wordID: UUID
+    @State private var isPresentingEdit = false
+
+    private var word: WordEntry? {
+        store.words.first { $0.id == wordID } 
+    }
+
+    var body: some View {
+        List {
+            if let word {
+                Section("单词") {
+                    LabeledContent("西班牙语", value: word.spanish)
+                    LabeledContent {
+                        MeaningText(text: word.meaningText, language: word.meaningLanguage, style: .body)
+                    } label: {
+                        Text(word.meaningLabel)
+                    }
+                    LabeledContent("词性", value: word.partOfSpeechLabel)
+                    LabeledContent("掌握度", value: word.masteryStatus.rawValue)
+                    LabeledContent("下一次复习", value: DateFormatters.shortDateTime.string(from: word.nextReviewDate))
+                }
+
+                if word.conjugation != nil {
+                    Section("动词变位") {
+                        if let conjugation = word.conjugation {
+                            ConjugationRow(subject: "yo", value: conjugation.yo)
+                            ConjugationRow(subject: "tu", value: conjugation.tu)
+                            ConjugationRow(subject: "el/ella", value: conjugation.elElla)
+                            ConjugationRow(subject: "nosotros", value: conjugation.nosotros)
+                            ConjugationRow(subject: "vosotros", value: conjugation.vosotros)
+                            ConjugationRow(subject: "ellos/ellas", value: conjugation.ellosEllas)
+                        } else {
+                            Text("尚未录入变位。")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if word.nounPlural?.trimmed.isEmpty == false {
+                    Section("名词形式") {
+                        DetailValueRow(label: "复数", value: word.nounPlural ?? "")
+                    }
+                }
+
+                if word.adjectiveForms != nil {
+                    Section("形容词形式") {
+                        let forms = word.adjectiveForms
+                        DetailValueRow(label: "阳性单数", value: forms?.masculineSingular ?? "")
+                        DetailValueRow(label: "阴性单数", value: forms?.feminineSingular ?? "")
+                        DetailValueRow(label: "阳性复数", value: forms?.masculinePlural ?? "")
+                        DetailValueRow(label: "阴性复数", value: forms?.femininePlural ?? "")
+                    }
+                }
+            } else {
+                Text("单词已删除或不存在。")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("详情")
+        .listStyle(.insetGrouped)
+        .toolbar {
+            if word != nil {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("编辑") {
+                        isPresentingEdit = true
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $isPresentingEdit) {
+            if let word {
+                EditWordView(word: word)
+            }
+        }
+    }
+}
+
+private struct ConjugationRow: View {
+    let subject: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(subject)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value.isEmpty ? "-" : value)
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+private struct DetailValueRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value.trimmed.isEmpty ? "-" : value)
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+struct AddWordView: View {
+    @EnvironmentObject private var store: StudyStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var spanish = ""
+    @State private var chinese = ""
+    @State private var meaningLanguage: MeaningLanguage = .english
+    @State private var partOfSpeech: PartOfSpeech = .other
+    @State private var isAnalyzing = false
+    @State private var analysisError: String?
+
+    @State private var yo = ""
+    @State private var tu = ""
+    @State private var elElla = ""
+    @State private var nosotros = ""
+    @State private var vosotros = ""
+    @State private var ellosEllas = ""
+    @State private var nounPlural = ""
+    @State private var adjectiveMasculineSingular = ""
+    @State private var adjectiveFeminineSingular = ""
+    @State private var adjectiveMasculinePlural = ""
+    @State private var adjectiveFemininePlural = ""
+
+    private var trimmedSpanish: String {
+        spanish.trimmed
+    }
+
+    private var trimmedMeaning: String {
+        chinese.trimmed
+    }
+
+    private var isDuplicateSpanish: Bool {
+        let key = trimmedSpanish.normalizedAnswer
+        guard !key.isEmpty else { return false }
+        return store.words.contains { $0.matchesSpanishVariant(trimmedSpanish) }
+    }
+
+    private var canSave: Bool {
+        !trimmedSpanish.isEmpty && !trimmedMeaning.isEmpty && !isDuplicateSpanish
+    }
+
+    private var showVerbForms: Bool {
+        partOfSpeech == .verb || hasConjugation
+    }
+
+    private var showNounForms: Bool {
+        partOfSpeech == .noun || !nounPlural.trimmed.isEmpty
+    }
+
+    private var showAdjectiveForms: Bool {
+        partOfSpeech == .adjective || hasAdjectiveForms
+    }
+
+    private var hasConjugation: Bool {
+        [yo, tu, elElla, nosotros, vosotros, ellosEllas].contains { !$0.trimmed.isEmpty }
+    }
+
+    private var hasAdjectiveForms: Bool {
+        [adjectiveMasculineSingular, adjectiveFeminineSingular, adjectiveMasculinePlural, adjectiveFemininePlural]
+            .contains { !$0.trimmed.isEmpty }
+    }
+
+    private var meaningPlaceholder: String {
+        meaningLanguage == .chinese ? "中文释义" : "英文释义"
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("基本信息") {
+                    TextField("西班牙语单词", text: $spanish)
+                        .textInputAutocapitalization(.never)
+                    Button {
+                        runAnalysis()
+                    } label: {
+                        Label("智能解析", systemImage: "sparkles")
+                    }
+                    .disabled(trimmedSpanish.isEmpty || isAnalyzing)
+                    if isAnalyzing {
+                        ProgressView("正在解析...")
+                    }
+                    if let analysisError {
+                        Text(analysisError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    if isDuplicateSpanish {
+                        Text("该西班牙语或其变形已添加，不能重复录入。")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    Picker("释义语言", selection: $meaningLanguage) {
+                        ForEach(MeaningLanguage.allCases) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    TextField(meaningPlaceholder, text: $chinese)
+                        .textInputAutocapitalization(.never)
+                }
+
+                Section("词性") {
+                    Picker("词性", selection: $partOfSpeech) {
+                        ForEach(PartOfSpeech.allCases) { part in
+                            Text(part.displayName).tag(part)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                if showVerbForms {
+                    Section("动词变位") {
+                        ConjugationInputRow(subject: "yo", text: $yo)
+                        ConjugationInputRow(subject: "tu", text: $tu)
+                        ConjugationInputRow(subject: "el/ella", text: $elElla)
+                        ConjugationInputRow(subject: "nosotros", text: $nosotros)
+                        ConjugationInputRow(subject: "vosotros", text: $vosotros)
+                        ConjugationInputRow(subject: "ellos/ellas", text: $ellosEllas)
+                    }
+                }
+
+                if showNounForms {
+                    Section("名词形式") {
+                        TextField("复数形式", text: $nounPlural)
+                            .textInputAutocapitalization(.never)
+                    }
+                }
+
+                if showAdjectiveForms {
+                    Section("形容词形式") {
+                        TextField("阳性单数", text: $adjectiveMasculineSingular)
+                            .textInputAutocapitalization(.never)
+                        TextField("阴性单数", text: $adjectiveFeminineSingular)
+                            .textInputAutocapitalization(.never)
+                        TextField("阳性复数", text: $adjectiveMasculinePlural)
+                            .textInputAutocapitalization(.never)
+                        TextField("阴性复数", text: $adjectiveFemininePlural)
+                            .textInputAutocapitalization(.never)
+                    }
+                }
+            }
+            .navigationTitle("新增生词")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        let conjugation = hasConjugation ? Conjugation(
+                            yo: yo.trimmed,
+                            tu: tu.trimmed,
+                            elElla: elElla.trimmed,
+                            nosotros: nosotros.trimmed,
+                            vosotros: vosotros.trimmed,
+                            ellosEllas: ellosEllas.trimmed
+                        ) : nil
+                        let nounPluralValue = nounPlural.trimmed.isEmpty ? nil : nounPlural.trimmed
+                        let adjectiveValue = hasAdjectiveForms ? AdjectiveForms(
+                            masculineSingular: adjectiveMasculineSingular.trimmed,
+                            feminineSingular: adjectiveFeminineSingular.trimmed,
+                            masculinePlural: adjectiveMasculinePlural.trimmed,
+                            femininePlural: adjectiveFemininePlural.trimmed
+                        ) : nil
+                        store.addWord(
+                            spanish: trimmedSpanish,
+                            chinese: trimmedMeaning,
+                            meaningLanguage: meaningLanguage,
+                            partOfSpeech: partOfSpeech,
+                            conjugation: conjugation,
+                            nounPlural: nounPluralValue,
+                            adjectiveForms: adjectiveValue
+                        )
+                        dismiss()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    private func runAnalysis() {
+        guard !trimmedSpanish.isEmpty else { return }
+        isAnalyzing = true
+        analysisError = nil
+        Task {
+            do {
+                let analysis = try await QwenService.shared.analyze(
+                    word: trimmedSpanish,
+                    targetLanguage: meaningLanguage
+                )
+                await MainActor.run {
+                    apply(analysis: analysis)
+                    isAnalyzing = false
+                }
+            } catch {
+                await MainActor.run {
+                    analysisError = error.localizedDescription
+                    isAnalyzing = false
+                }
+            }
+        }
+    }
+
+    private func apply(analysis: WordAnalysis) {
+        let normalizedLanguage = analysis.language.lowercased()
+        if normalizedLanguage == "en" {
+            meaningLanguage = .english
+        } else if normalizedLanguage == "zh" {
+            meaningLanguage = .chinese
+        }
+        if let lemma = analysis.lemma?.trimmed, !lemma.isEmpty {
+            spanish = lemma
+        }
+        chinese = analysis.meaning
+
+        let resolvedPart = resolvePartOfSpeech(analysis)
+        partOfSpeech = resolvedPart
+
+        if let conjugation = analysis.conjugation {
+            yo = conjugation.yo
+            tu = conjugation.tu
+            elElla = conjugation.elElla
+            nosotros = conjugation.nosotros
+            vosotros = conjugation.vosotros
+            ellosEllas = conjugation.ellosEllas
+        } else {
+            yo = ""
+            tu = ""
+            elElla = ""
+            nosotros = ""
+            vosotros = ""
+            ellosEllas = ""
+        }
+
+        if let plural = analysis.nounPlural?.trimmed, !plural.isEmpty {
+            nounPlural = plural
+        } else {
+            nounPlural = ""
+        }
+
+        if let forms = analysis.adjectiveForms {
+            adjectiveMasculineSingular = forms.masculineSingular
+            adjectiveFeminineSingular = forms.feminineSingular
+            adjectiveMasculinePlural = forms.masculinePlural
+            adjectiveFemininePlural = forms.femininePlural
+        } else {
+            adjectiveMasculineSingular = ""
+            adjectiveFeminineSingular = ""
+            adjectiveMasculinePlural = ""
+            adjectiveFemininePlural = ""
+        }
+    }
+
+    private func resolvePartOfSpeech(_ analysis: WordAnalysis) -> PartOfSpeech {
+        if analysis.conjugation != nil {
+            return .verb
+        }
+        if analysis.nounPlural?.trimmed.isEmpty == false {
+            return .noun
+        }
+        if analysis.adjectiveForms != nil {
+            return .adjective
+        }
+        if let raw = analysis.partOfSpeech?.lowercased(),
+           let part = PartOfSpeech(rawValue: raw) {
+            return part
+        }
+        if analysis.isVerb == true {
+            return .verb
+        }
+        return .other
+    }
+}
+
+struct EditWordView: View {
+    @EnvironmentObject private var store: StudyStore
+    @Environment(\.dismiss) private var dismiss
+
+    let wordID: UUID
+    @State private var spanish: String
+    @State private var meaning: String
+    @State private var meaningLanguage: MeaningLanguage
+    @State private var partOfSpeech: PartOfSpeech
+    @State private var isAnalyzing = false
+    @State private var analysisError: String?
+
+    @State private var yo: String
+    @State private var tu: String
+    @State private var elElla: String
+    @State private var nosotros: String
+    @State private var vosotros: String
+    @State private var ellosEllas: String
+    @State private var nounPlural: String
+    @State private var adjectiveMasculineSingular: String
+    @State private var adjectiveFeminineSingular: String
+    @State private var adjectiveMasculinePlural: String
+    @State private var adjectiveFemininePlural: String
+
+    init(word: WordEntry) {
+        wordID = word.id
+        _spanish = State(initialValue: word.spanish)
+        _meaning = State(initialValue: word.meaningText)
+        _meaningLanguage = State(initialValue: word.meaningLanguage)
+        _partOfSpeech = State(initialValue: word.partOfSpeech)
+
+        let conjugation = word.conjugation
+        _yo = State(initialValue: conjugation?.yo ?? "")
+        _tu = State(initialValue: conjugation?.tu ?? "")
+        _elElla = State(initialValue: conjugation?.elElla ?? "")
+        _nosotros = State(initialValue: conjugation?.nosotros ?? "")
+        _vosotros = State(initialValue: conjugation?.vosotros ?? "")
+        _ellosEllas = State(initialValue: conjugation?.ellosEllas ?? "")
+        _nounPlural = State(initialValue: word.nounPlural ?? "")
+        _adjectiveMasculineSingular = State(initialValue: word.adjectiveForms?.masculineSingular ?? "")
+        _adjectiveFeminineSingular = State(initialValue: word.adjectiveForms?.feminineSingular ?? "")
+        _adjectiveMasculinePlural = State(initialValue: word.adjectiveForms?.masculinePlural ?? "")
+        _adjectiveFemininePlural = State(initialValue: word.adjectiveForms?.femininePlural ?? "")
+    }
+
+    private var trimmedSpanish: String {
+        spanish.trimmed
+    }
+
+    private var trimmedMeaning: String {
+        meaning.trimmed
+    }
+
+    private var isDuplicateSpanish: Bool {
+        let key = trimmedSpanish.normalizedAnswer
+        guard !key.isEmpty else { return false }
+        return store.words.contains { $0.id != wordID && $0.matchesSpanishVariant(trimmedSpanish) }
+    }
+
+    private var canSave: Bool {
+        !trimmedSpanish.isEmpty && !trimmedMeaning.isEmpty && !isDuplicateSpanish
+    }
+
+    private var showVerbForms: Bool {
+        partOfSpeech == .verb || hasConjugation
+    }
+
+    private var showNounForms: Bool {
+        partOfSpeech == .noun || !nounPlural.trimmed.isEmpty
+    }
+
+    private var showAdjectiveForms: Bool {
+        partOfSpeech == .adjective || hasAdjectiveForms
+    }
+
+    private var hasConjugation: Bool {
+        [yo, tu, elElla, nosotros, vosotros, ellosEllas].contains { !$0.trimmed.isEmpty }
+    }
+
+    private var hasAdjectiveForms: Bool {
+        [adjectiveMasculineSingular, adjectiveFeminineSingular, adjectiveMasculinePlural, adjectiveFemininePlural]
+            .contains { !$0.trimmed.isEmpty }
+    }
+
+    private var meaningPlaceholder: String {
+        meaningLanguage == .chinese ? "中文释义" : "英文释义"
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("基本信息") {
+                    TextField("西班牙语单词", text: $spanish)
+                        .textInputAutocapitalization(.never)
+                    Button {
+                        runAnalysis()
+                    } label: {
+                        Label("智能解析", systemImage: "sparkles")
+                    }
+                    .disabled(trimmedSpanish.isEmpty || isAnalyzing)
+                    if isAnalyzing {
+                        ProgressView("正在解析...")
+                    }
+                    if let analysisError {
+                        Text(analysisError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    if isDuplicateSpanish {
+                        Text("该西班牙语或其变形已存在，不能重复。")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    Picker("释义语言", selection: $meaningLanguage) {
+                        ForEach(MeaningLanguage.allCases) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    TextField(meaningPlaceholder, text: $meaning)
+                        .textInputAutocapitalization(.never)
+                }
+
+                Section("词性") {
+                    Picker("词性", selection: $partOfSpeech) {
+                        ForEach(PartOfSpeech.allCases) { part in
+                            Text(part.displayName).tag(part)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                if showVerbForms {
+                    Section("动词变位") {
+                        ConjugationInputRow(subject: "yo", text: $yo)
+                        ConjugationInputRow(subject: "tu", text: $tu)
+                        ConjugationInputRow(subject: "el/ella", text: $elElla)
+                        ConjugationInputRow(subject: "nosotros", text: $nosotros)
+                        ConjugationInputRow(subject: "vosotros", text: $vosotros)
+                        ConjugationInputRow(subject: "ellos/ellas", text: $ellosEllas)
+                    }
+                }
+
+                if showNounForms {
+                    Section("名词形式") {
+                        TextField("复数形式", text: $nounPlural)
+                            .textInputAutocapitalization(.never)
+                    }
+                }
+
+                if showAdjectiveForms {
+                    Section("形容词形式") {
+                        TextField("阳性单数", text: $adjectiveMasculineSingular)
+                            .textInputAutocapitalization(.never)
+                        TextField("阴性单数", text: $adjectiveFeminineSingular)
+                            .textInputAutocapitalization(.never)
+                        TextField("阳性复数", text: $adjectiveMasculinePlural)
+                            .textInputAutocapitalization(.never)
+                        TextField("阴性复数", text: $adjectiveFemininePlural)
+                            .textInputAutocapitalization(.never)
+                    }
+                }
+            }
+            .navigationTitle("编辑生词")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        let conjugation = hasConjugation ? Conjugation(
+                            yo: yo.trimmed,
+                            tu: tu.trimmed,
+                            elElla: elElla.trimmed,
+                            nosotros: nosotros.trimmed,
+                            vosotros: vosotros.trimmed,
+                            ellosEllas: ellosEllas.trimmed
+                        ) : nil
+                        let nounPluralValue = nounPlural.trimmed.isEmpty ? nil : nounPlural.trimmed
+                        let adjectiveValue = hasAdjectiveForms ? AdjectiveForms(
+                            masculineSingular: adjectiveMasculineSingular.trimmed,
+                            feminineSingular: adjectiveFeminineSingular.trimmed,
+                            masculinePlural: adjectiveMasculinePlural.trimmed,
+                            femininePlural: adjectiveFemininePlural.trimmed
+                        ) : nil
+                        store.updateWord(
+                            id: wordID,
+                            spanish: trimmedSpanish,
+                            meaning: trimmedMeaning,
+                            meaningLanguage: meaningLanguage,
+                            partOfSpeech: partOfSpeech,
+                            conjugation: conjugation,
+                            nounPlural: nounPluralValue,
+                            adjectiveForms: adjectiveValue
+                        )
+                        dismiss()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+
+    private func runAnalysis() {
+        guard !trimmedSpanish.isEmpty else { return }
+        isAnalyzing = true
+        analysisError = nil
+        Task {
+            do {
+                let analysis = try await QwenService.shared.analyze(
+                    word: trimmedSpanish,
+                    targetLanguage: meaningLanguage
+                )
+                await MainActor.run {
+                    apply(analysis: analysis)
+                    isAnalyzing = false
+                }
+            } catch {
+                await MainActor.run {
+                    analysisError = error.localizedDescription
+                    isAnalyzing = false
+                }
+            }
+        }
+    }
+
+    private func apply(analysis: WordAnalysis) {
+        let normalizedLanguage = analysis.language.lowercased()
+        if normalizedLanguage == "en" {
+            meaningLanguage = .english
+        } else if normalizedLanguage == "zh" {
+            meaningLanguage = .chinese
+        }
+        if let lemma = analysis.lemma?.trimmed, !lemma.isEmpty {
+            spanish = lemma
+        }
+        meaning = analysis.meaning
+
+        let resolvedPart = resolvePartOfSpeech(analysis)
+        partOfSpeech = resolvedPart
+
+        if let conjugation = analysis.conjugation {
+            yo = conjugation.yo
+            tu = conjugation.tu
+            elElla = conjugation.elElla
+            nosotros = conjugation.nosotros
+            vosotros = conjugation.vosotros
+            ellosEllas = conjugation.ellosEllas
+        } else {
+            yo = ""
+            tu = ""
+            elElla = ""
+            nosotros = ""
+            vosotros = ""
+            ellosEllas = ""
+        }
+
+        if let plural = analysis.nounPlural?.trimmed, !plural.isEmpty {
+            nounPlural = plural
+        } else {
+            nounPlural = ""
+        }
+
+        if let forms = analysis.adjectiveForms {
+            adjectiveMasculineSingular = forms.masculineSingular
+            adjectiveFeminineSingular = forms.feminineSingular
+            adjectiveMasculinePlural = forms.masculinePlural
+            adjectiveFemininePlural = forms.femininePlural
+        } else {
+            adjectiveMasculineSingular = ""
+            adjectiveFeminineSingular = ""
+            adjectiveMasculinePlural = ""
+            adjectiveFemininePlural = ""
+        }
+    }
+
+    private func resolvePartOfSpeech(_ analysis: WordAnalysis) -> PartOfSpeech {
+        if analysis.conjugation != nil {
+            return .verb
+        }
+        if analysis.nounPlural?.trimmed.isEmpty == false {
+            return .noun
+        }
+        if analysis.adjectiveForms != nil {
+            return .adjective
+        }
+        if let raw = analysis.partOfSpeech?.lowercased(),
+           let part = PartOfSpeech(rawValue: raw) {
+            return part
+        }
+        if analysis.isVerb == true {
+            return .verb
+        }
+        return .other
+    }
+}
+
+private struct ConjugationInputRow: View {
+    let subject: String
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(subject)
+                .frame(width: 90, alignment: .leading)
+                .foregroundStyle(.secondary)
+            TextField("变位", text: $text)
+                .textInputAutocapitalization(.never)
+        }
+    }
+}
+
+#Preview {
+    VocabularyListView()
+        .environmentObject(StudyStore())
+}
