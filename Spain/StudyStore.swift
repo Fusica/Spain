@@ -204,6 +204,25 @@ final class StudyStore: ObservableObject {
         try? encoded.write(to: storageURL, options: [.atomic])
     }
 
+    func exportBackup() throws -> Data {
+        let data = AppData(words: words, reminderTime: reminderTime, remindersEnabled: remindersEnabled)
+        return try JSONEncoder().encode(data)
+    }
+
+    func importBackup(_ data: Data) throws {
+        let decoded = try JSONDecoder().decode(AppData.self, from: data)
+        words = decoded.words
+        reminderTime = decoded.reminderTime
+        remindersEnabled = decoded.remindersEnabled
+        hasLoaded = true
+        persist()
+        if remindersEnabled {
+            scheduleReminder()
+        } else {
+            cancelReminder()
+        }
+    }
+
     private func scheduleReminder() {
         cancelReminder()
 
