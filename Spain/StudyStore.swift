@@ -40,7 +40,8 @@ final class StudyStore: ObservableObject {
         partOfSpeech: PartOfSpeech,
         conjugation: Conjugation?,
         nounPlural: String?,
-        adjectiveForms: AdjectiveForms?
+        adjectiveForms: AdjectiveForms?,
+        memoryTips: String? = nil
     ) {
         let now = Date()
         let entry = WordEntry(
@@ -54,7 +55,8 @@ final class StudyStore: ObservableObject {
             createdAt: now,
             reviewStage: 0,
             nextReviewDate: ReviewSchedule.nextDate(from: now, stage: 0),
-            meaningLanguage: meaningLanguage
+            meaningLanguage: meaningLanguage,
+            memoryTips: memoryTips
         )
         words.insert(entry, at: 0)
         persist()
@@ -93,9 +95,40 @@ final class StudyStore: ObservableObject {
         }
     }
 
+    func applyAnalysis(for id: UUID, analysis: WordAnalysis) {
+        updateWord(id: id) { word in
+            let normalizedLanguage = analysis.language.lowercased()
+            if normalizedLanguage == "en" {
+                word.meaningLanguage = .english
+            } else if normalizedLanguage == "zh" {
+                word.meaningLanguage = .chinese
+            }
+            if let lemma = analysis.lemma?.trimmed, !lemma.isEmpty {
+                word.spanish = lemma
+            }
+            word.chinese = analysis.meaning
+
+            let resolvedPart = resolvePartOfSpeech(analysis)
+            word.partOfSpeech = resolvedPart
+            word.isVerb = resolvedPart == .verb || analysis.conjugation != nil
+            word.conjugation = analysis.conjugation
+
+            let plural = analysis.nounPlural?.trimmed ?? ""
+            word.nounPlural = plural.isEmpty ? nil : plural
+            word.adjectiveForms = analysis.adjectiveForms
+        }
+    }
+
+    func updateTips(for id: UUID, tips: String?) {
+        updateWord(id: id) { word in
+            let trimmed = tips?.trimmed ?? ""
+            word.memoryTips = trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
     func dueWords(reference: Date = Date()) -> [WordEntry] {
         words
-            .filter { $0.nextReviewDate <= reference }
+            .filter { $0.lastReviewedAt != nil && $0.nextReviewDate <= reference }
             .sorted { $0.nextReviewDate < $1.nextReviewDate }
     }
 
@@ -105,16 +138,17 @@ final class StudyStore: ObservableObject {
             return Array(due.prefix(count))
         }
 
-        let upcoming = words
-            .filter { $0.nextReviewDate > reference }
-            .sorted { $0.nextReviewDate < $1.nextReviewDate }
-        let needed = max(count - due.count, 0)
-        return due + Array(upcoming.prefix(needed))
+        let newWords = words
+            .filter { $0.lastReviewedAt == nil }
+            .sorted { $0.createdAt < $1.createdAt }
+        let neededNew = max(count - due.count, 0)
+        let pickedNew = Array(newWords.prefix(neededNew))
+        return due + pickedNew
     }
 
     func advanceReview(for id: UUID, now: Date = Date()) {
         updateWord(id: id) { word in
-            let nextStage = min(word.reviewStage + 1, ReviewSchedule.intervals.count - 1)
+            let nextStage = min(word.reviewStage + 1, ReviewSchedule.dayIntervals.count - 1)
             word.reviewStage = nextStage
             word.nextReviewDate = ReviewSchedule.nextDate(from: now, stage: nextStage)
             word.lastReviewedAt = now
@@ -131,7 +165,7 @@ final class StudyStore: ObservableObject {
 
     func applySessionResult(for id: UUID, errors: Int, now: Date = Date()) {
         updateWord(id: id) { word in
-            let maxStage = ReviewSchedule.intervals.count - 1
+            let maxStage = ReviewSchedule.dayIntervals.count - 1
             var stage = min(max(word.reviewStage, 0), maxStage)
             if errors == 0 {
                 stage = min(stage + 1, maxStage)
@@ -182,9 +216,33 @@ final class StudyStore: ObservableObject {
         persist()
     }
 
+    private func resolvePartOfSpeech(_ analysis: WordAnalysis) -> PartOfSpeech {
+        if analysis.conjugation != nil {
+            return .verb
+        }
+        if analysis.nounPlural?.trimmed.isEmpty == false {
+            return .noun
+        }
+        if analysis.adjectiveForms != nil {
+            return .adjective
+        }
+        if let raw = analysis.partOfSpeech?.lowercased(),
+           let part = PartOfSpeech(rawValue: raw) {
+            return part
+        }
+        if analysis.isVerb == true {
+            return .verb
+        }
+        return .other
+    }
+
     private func load() {
+        var shouldPersist = false
         defer {
             hasLoaded = true
+            if shouldPersist {
+                persist()
+            }
             if remindersEnabled {
                 scheduleReminder()
             }
@@ -195,6 +253,7 @@ final class StudyStore: ObservableObject {
         words = decoded.words
         reminderTime = decoded.reminderTime
         remindersEnabled = decoded.remindersEnabled
+        shouldPersist = normalizeReviewDatesIfNeeded()
     }
 
     private func persist() {
@@ -202,6 +261,19 @@ final class StudyStore: ObservableObject {
         let data = AppData(words: words, reminderTime: reminderTime, remindersEnabled: remindersEnabled)
         guard let encoded = try? JSONEncoder().encode(data) else { return }
         try? encoded.write(to: storageURL, options: [.atomic])
+    }
+
+    private func normalizeReviewDatesIfNeeded() -> Bool {
+        var didChange = false
+        for index in words.indices {
+            let anchor = words[index].lastReviewedAt ?? words[index].createdAt
+            let normalizedDate = ReviewSchedule.nextDate(from: anchor, stage: words[index].reviewStage)
+            if words[index].nextReviewDate != normalizedDate {
+                words[index].nextReviewDate = normalizedDate
+                didChange = true
+            }
+        }
+        return didChange
     }
 
     func exportBackup() throws -> Data {

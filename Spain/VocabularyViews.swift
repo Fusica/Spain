@@ -52,19 +52,69 @@ private enum MasteryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+private enum BulkUpdateMode {
+    case analysis
+    case tips
+    case both
+
+    var label: String {
+        switch self {
+        case .analysis:
+            return "全部智能解析"
+        case .tips:
+            return "全部记忆技巧"
+        case .both:
+            return "智能解析 + 记忆技巧"
+        }
+    }
+
+    var progressLabel: String {
+        switch self {
+        case .analysis:
+            return "正在更新释义..."
+        case .tips:
+            return "正在更新记忆技巧..."
+        case .both:
+            return "正在更新全部内容..."
+        }
+    }
+
+    var includesAnalysis: Bool {
+        self == .analysis || self == .both
+    }
+
+    var includesTips: Bool {
+        self == .tips || self == .both
+    }
+}
+
+private func normalizeTipsText(_ text: String) -> String {
+    let trimmed = text.trimmed
+    guard !trimmed.isEmpty else { return "" }
+    let lowercased = trimmed.lowercased()
+    if lowercased.hasPrefix("tips") {
+        let remainder = trimmed.dropFirst(4)
+        let content = remainder.drop(while: { $0 == ":" || $0 == "：" || $0 == " " })
+        let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? "Tips:" : "Tips: \(normalized)"
+    }
+    return "Tips: \(trimmed)"
+}
+
 struct VocabularyListView: View {
     @EnvironmentObject private var store: StudyStore
     @State private var isPresentingAdd = false
     @State private var searchText = ""
     @State private var statusFilter: MasteryFilter = .all
+    @State private var isBulkUpdating = false
+    @State private var bulkProgress = 0
+    @State private var bulkTotal = 0
+    @State private var showBulkError = false
+    @State private var bulkErrorMessage = ""
+    @State private var showSelectionUpdate = false
 
     private var sortedWords: [WordEntry] {
-        store.words.sorted {
-            if $0.nextReviewDate == $1.nextReviewDate {
-                return $0.createdAt > $1.createdAt
-            }
-            return $0.nextReviewDate < $1.nextReviewDate
-        }
+        store.words
     }
 
     private var filteredWords: [WordEntry] {
@@ -84,6 +134,11 @@ struct VocabularyListView: View {
             return "\(base) \(count(for: filter))"
         }
         return base
+    }
+
+    private var bulkProgressFraction: Double {
+        guard bulkTotal > 0 else { return 0 }
+        return min(max(Double(bulkProgress) / Double(bulkTotal), 0), 1)
     }
 
     var body: some View {
@@ -149,6 +204,55 @@ struct VocabularyListView: View {
             }
             .navigationTitle("词汇 \(store.words.count)")
             .searchable(text: $searchText, prompt: "搜索西班牙语、变形或释义")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button("选择单词更新") {
+                            showSelectionUpdate = true
+                        }
+                        Divider()
+                        Button(BulkUpdateMode.analysis.label) {
+                            startBulkUpdate(.analysis)
+                        }
+                        Button(BulkUpdateMode.tips.label) {
+                            startBulkUpdate(.tips)
+                        }
+                        Button(BulkUpdateMode.both.label) {
+                            startBulkUpdate(.both)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            ZStack {
+                                Circle()
+                                    .stroke(Color.blue.opacity(0.2), lineWidth: 2)
+                                    .opacity(isBulkUpdating ? 1 : 0)
+                                Circle()
+                            .trim(from: 0, to: bulkProgressFraction)
+                            .stroke(Color.blue, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .opacity(isBulkUpdating ? 1 : 0)
+                            .animation(.easeInOut(duration: 0.2), value: bulkProgress)
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .rotationEffect(.degrees(isBulkUpdating ? 360 : 0))
+                            .animation(
+                                isBulkUpdating
+                                    ? .linear(duration: 1).repeatForever(autoreverses: false)
+                                    : .default,
+                                value: isBulkUpdating
+                            )
+                    }
+                    .frame(width: 24, height: 24)
+                    Text("一键更新")
+                }
+            }
+                    .disabled(isBulkUpdating || store.words.isEmpty)
+                }
+            }
+            .alert("批量更新失败", isPresented: $showBulkError) {
+                Button("确定", role: .cancel) {}
+            } message: {
+                Text(bulkErrorMessage)
+            }
             .overlay(alignment: .bottomTrailing) {
                 Button {
                     isPresentingAdd = true
@@ -170,6 +274,190 @@ struct VocabularyListView: View {
             .sheet(isPresented: $isPresentingAdd) {
                 AddWordView()
             }
+            .navigationDestination(isPresented: $showSelectionUpdate) {
+                SelectedUpdateView()
+            }
+        }
+    }
+
+    private func startBulkUpdate(_ mode: BulkUpdateMode) {
+        guard !isBulkUpdating else { return }
+        Task {
+            let words = await MainActor.run { store.words }
+            guard !words.isEmpty else { return }
+            _ = await MainActor.run {
+                isBulkUpdating = true
+                bulkProgress = 0
+                bulkTotal = words.count
+                bulkErrorMessage = ""
+                showBulkError = false
+            }
+
+            for word in words {
+                do {
+                    var resolvedWord = word
+                    if mode.includesAnalysis {
+                        let analysis = try await QwenService.shared.analyze(
+                            word: resolvedWord.spanish,
+                            targetLanguage: resolvedWord.meaningLanguage
+                        )
+                        _ = await MainActor.run {
+                            store.applyAnalysis(for: resolvedWord.id, analysis: analysis)
+                        }
+                        resolvedWord = await MainActor.run {
+                            store.words.first { $0.id == resolvedWord.id } ?? resolvedWord
+                        }
+                    }
+                    if mode.includesTips {
+                        let tips = try await QwenService.shared.generateTips(for: resolvedWord)
+                        let normalized = normalizeTipsText(tips.tips)
+                        _ = await MainActor.run {
+                            store.updateTips(for: resolvedWord.id, tips: normalized)
+                        }
+                    }
+                } catch {
+                    _ = await MainActor.run {
+                        bulkErrorMessage = error.localizedDescription
+                        showBulkError = true
+                        isBulkUpdating = false
+                    }
+                    return
+                }
+                _ = await MainActor.run {
+                    bulkProgress += 1
+                }
+            }
+
+            _ = await MainActor.run {
+                isBulkUpdating = false
+            }
+        }
+    }
+
+}
+
+private struct SelectedUpdateView: View {
+    @EnvironmentObject private var store: StudyStore
+    @State private var selectedIds: Set<UUID> = []
+    @State private var isUpdating = false
+    @State private var progress = 0
+    @State private var total = 0
+    @State private var showError = false
+    @State private var errorMessage = ""
+
+    private var sortedWords: [WordEntry] {
+        store.words.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    var body: some View {
+        List {
+            if isUpdating {
+                Section {
+                    ProgressView(value: Double(progress), total: Double(max(total, 1)))
+                    Text("已更新 \(progress)/\(total)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(sortedWords) { word in
+                Button {
+                    toggleSelection(word.id)
+                } label: {
+                    HStack(alignment: .top, spacing: 12) {
+                        WordRowView(word: word)
+                        Image(systemName: selectedIds.contains(word.id) ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selectedIds.contains(word.id) ? .blue : .secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .disabled(isUpdating)
+        .navigationTitle("选择单词 \(selectedIds.count)")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button(BulkUpdateMode.analysis.label) {
+                        startSelectedUpdate(.analysis)
+                    }
+                    Button(BulkUpdateMode.tips.label) {
+                        startSelectedUpdate(.tips)
+                    }
+                    Button(BulkUpdateMode.both.label) {
+                        startSelectedUpdate(.both)
+                    }
+                } label: {
+                    Label("更新所选", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(isUpdating || selectedIds.isEmpty)
+            }
+        }
+        .alert("批量更新失败", isPresented: $showError) {
+            Button("确定", role: .cancel) {}
+        } message: {
+            Text(errorMessage)
+        }
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedIds.contains(id) {
+            selectedIds.remove(id)
+        } else {
+            selectedIds.insert(id)
+        }
+    }
+
+    private func startSelectedUpdate(_ mode: BulkUpdateMode) {
+        guard !isUpdating else { return }
+        let words = store.words.filter { selectedIds.contains($0.id) }
+        guard !words.isEmpty else { return }
+        Task {
+            _ = await MainActor.run {
+                isUpdating = true
+                progress = 0
+                total = words.count
+                errorMessage = ""
+                showError = false
+            }
+
+            for word in words {
+                do {
+                    var resolvedWord = word
+                    if mode.includesAnalysis {
+                        let analysis = try await QwenService.shared.analyze(
+                            word: resolvedWord.spanish,
+                            targetLanguage: resolvedWord.meaningLanguage
+                        )
+                        _ = await MainActor.run {
+                            store.applyAnalysis(for: resolvedWord.id, analysis: analysis)
+                        }
+                        resolvedWord = await MainActor.run {
+                            store.words.first { $0.id == resolvedWord.id } ?? resolvedWord
+                        }
+                    }
+                    if mode.includesTips {
+                        let tips = try await QwenService.shared.generateTips(for: resolvedWord)
+                        let normalized = normalizeTipsText(tips.tips)
+                        _ = await MainActor.run {
+                            store.updateTips(for: resolvedWord.id, tips: normalized)
+                        }
+                    }
+                } catch {
+                    _ = await MainActor.run {
+                        errorMessage = error.localizedDescription
+                        showError = true
+                        isUpdating = false
+                    }
+                    return
+                }
+                _ = await MainActor.run {
+                    progress += 1
+                }
+            }
+
+            _ = await MainActor.run {
+                isUpdating = false
+            }
         }
     }
 }
@@ -178,10 +466,17 @@ private struct WordRowView: View {
     let word: WordEntry
 
     private var dueLabel: String {
+        if word.lastReviewedAt == nil {
+            return "未开始"
+        }
         if word.nextReviewDate <= Date() {
             return "待复习"
         }
         return DateFormatters.shortDateTime.string(from: word.nextReviewDate)
+    }
+
+    private var isDueForReview: Bool {
+        word.lastReviewedAt != nil && word.nextReviewDate <= Date()
     }
 
     var body: some View {
@@ -208,7 +503,7 @@ private struct WordRowView: View {
                 .foregroundStyle(.secondary)
             Text("下次复习：\(dueLabel)")
                 .font(.caption)
-                .foregroundStyle(word.nextReviewDate <= Date() ? .orange : .secondary)
+                .foregroundStyle(isDueForReview ? .orange : .secondary)
         }
         .padding(.vertical, 4)
     }
@@ -284,6 +579,16 @@ struct WordDetailView: View {
                         DetailValueRow(label: "阴性复数", value: forms?.femininePlural ?? "")
                     }
                 }
+
+                Section("记忆技巧") {
+                    if let tips = word.memoryTips?.trimmed, !tips.isEmpty {
+                        Text(tips)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("暂无记忆技巧。")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } else {
                 Text("单词已删除或不存在。")
                     .foregroundStyle(.secondary)
@@ -340,6 +645,25 @@ private struct DetailValueRow: View {
     }
 }
 
+private struct TipsEditor: View {
+    @Binding var text: String
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            if text.trimmed.isEmpty {
+                Text("暂无记忆技巧。")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 8)
+                    .padding(.leading, 4)
+            }
+            TextEditor(text: $text)
+                .frame(minHeight: 80)
+                .textInputAutocapitalization(.never)
+        }
+    }
+}
+
 struct AddWordView: View {
     @EnvironmentObject private var store: StudyStore
     @Environment(\.dismiss) private var dismiss
@@ -362,6 +686,9 @@ struct AddWordView: View {
     @State private var adjectiveFeminineSingular = ""
     @State private var adjectiveMasculinePlural = ""
     @State private var adjectiveFemininePlural = ""
+    @State private var memoryTips = ""
+    @State private var isGeneratingTips = false
+    @State private var tipsError: String?
 
     private var trimmedSpanish: String {
         spanish.trimmed
@@ -371,6 +698,10 @@ struct AddWordView: View {
         chinese.trimmed
     }
 
+    private var trimmedMemoryTips: String {
+        memoryTips.trimmed
+    }
+
     private var isDuplicateSpanish: Bool {
         let key = trimmedSpanish.normalizedAnswer
         guard !key.isEmpty else { return false }
@@ -378,7 +709,7 @@ struct AddWordView: View {
     }
 
     private var canSave: Bool {
-        !trimmedSpanish.isEmpty && !trimmedMeaning.isEmpty && !isDuplicateSpanish
+        !trimmedSpanish.isEmpty && !isDuplicateSpanish
     }
 
     private var showVerbForms: Bool {
@@ -480,6 +811,24 @@ struct AddWordView: View {
                             .textInputAutocapitalization(.never)
                     }
                 }
+
+                Section("记忆技巧") {
+                    Button {
+                        generateTips()
+                    } label: {
+                        Label("生成记忆技巧", systemImage: "sparkles")
+                    }
+                    .disabled(trimmedSpanish.isEmpty || isGeneratingTips)
+                    if isGeneratingTips {
+                        ProgressView("正在生成...")
+                    }
+                    if let tipsError {
+                        Text(tipsError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    TipsEditor(text: $memoryTips)
+                }
             }
             .navigationTitle("新增生词")
             .toolbar {
@@ -512,7 +861,8 @@ struct AddWordView: View {
                             partOfSpeech: partOfSpeech,
                             conjugation: conjugation,
                             nounPlural: nounPluralValue,
-                            adjectiveForms: adjectiveValue
+                            adjectiveForms: adjectiveValue,
+                            memoryTips: trimmedMemoryTips.isEmpty ? nil : trimmedMemoryTips
                         )
                         dismiss()
                     }
@@ -526,23 +876,92 @@ struct AddWordView: View {
         guard !trimmedSpanish.isEmpty else { return }
         isAnalyzing = true
         analysisError = nil
+        tipsError = nil
         Task {
             do {
                 let analysis = try await QwenService.shared.analyze(
                     word: trimmedSpanish,
                     targetLanguage: meaningLanguage
                 )
-                await MainActor.run {
+                _ = await MainActor.run {
                     apply(analysis: analysis)
                     isAnalyzing = false
                 }
+                await generateTipsFromCurrentWord()
             } catch {
-                await MainActor.run {
+                _ = await MainActor.run {
                     analysisError = error.localizedDescription
                     isAnalyzing = false
                 }
             }
         }
+    }
+
+    @MainActor
+    private func generateTipsFromCurrentWord() async {
+        guard !trimmedSpanish.isEmpty else { return }
+        tipsError = nil
+        isGeneratingTips = true
+        let word = buildTipsWord()
+        do {
+            let tips = try await QwenService.shared.generateTips(for: word)
+            memoryTips = normalizeTips(tips.tips)
+            isGeneratingTips = false
+        } catch {
+            tipsError = error.localizedDescription
+            isGeneratingTips = false
+        }
+    }
+
+    private func generateTips() {
+        Task { @MainActor in
+            await generateTipsFromCurrentWord()
+        }
+    }
+
+    private func buildTipsWord() -> WordEntry {
+        let conjugation = hasConjugation ? Conjugation(
+            yo: yo.trimmed,
+            tu: tu.trimmed,
+            elElla: elElla.trimmed,
+            nosotros: nosotros.trimmed,
+            vosotros: vosotros.trimmed,
+            ellosEllas: ellosEllas.trimmed
+        ) : nil
+        let nounPluralValue = nounPlural.trimmed.isEmpty ? nil : nounPlural.trimmed
+        let adjectiveValue = hasAdjectiveForms ? AdjectiveForms(
+            masculineSingular: adjectiveMasculineSingular.trimmed,
+            feminineSingular: adjectiveFeminineSingular.trimmed,
+            masculinePlural: adjectiveMasculinePlural.trimmed,
+            femininePlural: adjectiveFemininePlural.trimmed
+        ) : nil
+        let now = Date()
+        return WordEntry(
+            id: UUID(),
+            spanish: trimmedSpanish,
+            chinese: trimmedMeaning,
+            partOfSpeech: partOfSpeech,
+            conjugation: conjugation,
+            nounPlural: nounPluralValue,
+            adjectiveForms: adjectiveValue,
+            createdAt: now,
+            reviewStage: 0,
+            nextReviewDate: ReviewSchedule.nextDate(from: now, stage: 0),
+            meaningLanguage: meaningLanguage
+        )
+    }
+
+    private func normalizeTips(_ text: String) -> String {
+        let trimmed = text.trimmed
+        guard !trimmed.isEmpty else { return "" }
+        let lowercased = trimmed.lowercased()
+        if lowercased.hasPrefix("tips") {
+            let remainder = trimmed.dropFirst(4)
+            let content = remainder.drop(while: { $0 == ":" || $0 == "：" || $0 == " " })
+            let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized.isEmpty ? "Tips:" : "Tips: \(normalized)"
+        }
+        return "Tips: \(trimmed)"
     }
 
     private func apply(analysis: WordAnalysis) {
@@ -639,6 +1058,9 @@ struct EditWordView: View {
     @State private var adjectiveFeminineSingular: String
     @State private var adjectiveMasculinePlural: String
     @State private var adjectiveFemininePlural: String
+    @State private var memoryTips: String
+    @State private var isGeneratingTips = false
+    @State private var tipsError: String?
 
     init(word: WordEntry) {
         wordID = word.id
@@ -659,6 +1081,7 @@ struct EditWordView: View {
         _adjectiveFeminineSingular = State(initialValue: word.adjectiveForms?.feminineSingular ?? "")
         _adjectiveMasculinePlural = State(initialValue: word.adjectiveForms?.masculinePlural ?? "")
         _adjectiveFemininePlural = State(initialValue: word.adjectiveForms?.femininePlural ?? "")
+        _memoryTips = State(initialValue: word.memoryTips ?? "")
     }
 
     private var trimmedSpanish: String {
@@ -667,6 +1090,10 @@ struct EditWordView: View {
 
     private var trimmedMeaning: String {
         meaning.trimmed
+    }
+
+    private var trimmedMemoryTips: String {
+        memoryTips.trimmed
     }
 
     private var isDuplicateSpanish: Bool {
@@ -778,6 +1205,24 @@ struct EditWordView: View {
                             .textInputAutocapitalization(.never)
                     }
                 }
+
+                Section("记忆技巧") {
+                    Button {
+                        generateTips()
+                    } label: {
+                        Label("生成记忆技巧", systemImage: "sparkles")
+                    }
+                    .disabled(trimmedSpanish.isEmpty || isGeneratingTips)
+                    if isGeneratingTips {
+                        ProgressView("正在生成...")
+                    }
+                    if let tipsError {
+                        Text(tipsError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    TipsEditor(text: $memoryTips)
+                }
             }
             .navigationTitle("编辑生词")
             .toolbar {
@@ -813,6 +1258,7 @@ struct EditWordView: View {
                             nounPlural: nounPluralValue,
                             adjectiveForms: adjectiveValue
                         )
+                        store.updateTips(for: wordID, tips: trimmedMemoryTips)
                         dismiss()
                     }
                     .disabled(!canSave)
@@ -825,23 +1271,92 @@ struct EditWordView: View {
         guard !trimmedSpanish.isEmpty else { return }
         isAnalyzing = true
         analysisError = nil
+        tipsError = nil
         Task {
             do {
                 let analysis = try await QwenService.shared.analyze(
                     word: trimmedSpanish,
                     targetLanguage: meaningLanguage
                 )
-                await MainActor.run {
+                _ = await MainActor.run {
                     apply(analysis: analysis)
                     isAnalyzing = false
                 }
+                await generateTipsFromCurrentWord()
             } catch {
-                await MainActor.run {
+                _ = await MainActor.run {
                     analysisError = error.localizedDescription
                     isAnalyzing = false
                 }
             }
         }
+    }
+
+    @MainActor
+    private func generateTipsFromCurrentWord() async {
+        guard !trimmedSpanish.isEmpty else { return }
+        tipsError = nil
+        isGeneratingTips = true
+        let word = buildTipsWord()
+        do {
+            let tips = try await QwenService.shared.generateTips(for: word)
+            memoryTips = normalizeTips(tips.tips)
+            isGeneratingTips = false
+        } catch {
+            tipsError = error.localizedDescription
+            isGeneratingTips = false
+        }
+    }
+
+    private func generateTips() {
+        Task { @MainActor in
+            await generateTipsFromCurrentWord()
+        }
+    }
+
+    private func buildTipsWord() -> WordEntry {
+        let conjugation = hasConjugation ? Conjugation(
+            yo: yo.trimmed,
+            tu: tu.trimmed,
+            elElla: elElla.trimmed,
+            nosotros: nosotros.trimmed,
+            vosotros: vosotros.trimmed,
+            ellosEllas: ellosEllas.trimmed
+        ) : nil
+        let nounPluralValue = nounPlural.trimmed.isEmpty ? nil : nounPlural.trimmed
+        let adjectiveValue = hasAdjectiveForms ? AdjectiveForms(
+            masculineSingular: adjectiveMasculineSingular.trimmed,
+            feminineSingular: adjectiveFeminineSingular.trimmed,
+            masculinePlural: adjectiveMasculinePlural.trimmed,
+            femininePlural: adjectiveFemininePlural.trimmed
+        ) : nil
+        let now = Date()
+        return WordEntry(
+            id: wordID,
+            spanish: trimmedSpanish,
+            chinese: trimmedMeaning,
+            partOfSpeech: partOfSpeech,
+            conjugation: conjugation,
+            nounPlural: nounPluralValue,
+            adjectiveForms: adjectiveValue,
+            createdAt: now,
+            reviewStage: 0,
+            nextReviewDate: ReviewSchedule.nextDate(from: now, stage: 0),
+            meaningLanguage: meaningLanguage
+        )
+    }
+
+    private func normalizeTips(_ text: String) -> String {
+        let trimmed = text.trimmed
+        guard !trimmed.isEmpty else { return "" }
+        let lowercased = trimmed.lowercased()
+        if lowercased.hasPrefix("tips") {
+            let remainder = trimmed.dropFirst(4)
+            let content = remainder.drop(while: { $0 == ":" || $0 == "：" || $0 == " " })
+            let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized.isEmpty ? "Tips:" : "Tips: \(normalized)"
+        }
+        return "Tips: \(trimmed)"
     }
 
     private func apply(analysis: WordAnalysis) {

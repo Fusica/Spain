@@ -18,6 +18,10 @@ struct WordAnalysis: Codable {
     let adjectiveForms: AdjectiveForms?
 }
 
+struct WordTips: Codable {
+    let tips: String
+}
+
 enum QwenServiceError: LocalizedError {
     case missingApiKey
     case httpError(code: Int, message: String)
@@ -90,6 +94,51 @@ final class QwenService {
         return analysis
     }
 
+    func generateTips(for word: WordEntry) async throws -> WordTips {
+        let apiKey = AppConfig.qwenApiKey
+        guard !apiKey.isEmpty else { throw QwenServiceError.missingApiKey }
+
+        let prompt = buildTipsPrompt(for: word)
+        let requestBody = QwenChatRequest(
+            model: AppConfig.qwenModel,
+            messages: [
+                QwenMessage(role: "system", content: prompt.system),
+                QwenMessage(role: "user", content: prompt.user)
+            ],
+            temperature: 0.7
+        )
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
+        request.httpMethod = "POST"
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(requestBody)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw QwenServiceError.invalidResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw QwenServiceError.httpError(code: httpResponse.statusCode, message: message)
+        }
+
+        let decoded = try JSONDecoder().decode(QwenChatResponse.self, from: data)
+        guard let content = decoded.choices.first?.message.content else {
+            throw QwenServiceError.invalidResponse
+        }
+
+        guard let jsonString = extractJSONObject(from: content) else {
+            throw QwenServiceError.invalidResponse
+        }
+
+        guard let jsonData = jsonString.data(using: .utf8),
+              let tips = try? JSONDecoder().decode(WordTips.self, from: jsonData) else {
+            throw QwenServiceError.parseFailed
+        }
+        return tips
+    }
+
     private func buildPrompt(word: String, targetLanguage: MeaningLanguage) -> (system: String, user: String) {
         let languageCode = targetLanguage == .chinese ? "zh" : "en"
         let system = """
@@ -128,6 +177,50 @@ final class QwenService {
         let user = """
         输入词：\(word)
         释义语言：\(languageCode)
+        """
+        return (system, user)
+    }
+
+    private func buildTipsPrompt(for word: WordEntry) -> (system: String, user: String) {
+        let languageCode = "zh"
+        let conjugation: String
+        if let conjugationValue = word.conjugation {
+            conjugation = """
+            yo=\(conjugationValue.yo), tu=\(conjugationValue.tu), el/ella=\(conjugationValue.elElla), \
+            nosotros=\(conjugationValue.nosotros), vosotros=\(conjugationValue.vosotros), ellos/ellas=\(conjugationValue.ellosEllas)
+            """
+        } else {
+            conjugation = "无"
+        }
+        let nounPlural = word.nounPlural?.trimmed.isEmpty == false ? word.nounPlural ?? "" : "无"
+        let adjectiveForms: String
+        if let forms = word.adjectiveForms {
+            adjectiveForms = """
+            masculino sg=\(forms.masculineSingular), femenino sg=\(forms.feminineSingular), \
+            masculino pl=\(forms.masculinePlural), femenino pl=\(forms.femininePlural)
+            """
+        } else {
+            adjectiveForms = "无"
+        }
+
+        let system = """
+        你是西班牙语记忆教练。只能输出 JSON，禁止任何解释或额外文本。
+        输出必须严格符合此 schema：
+        {
+          "tips": string
+        }
+        tips 必须以 "Tips:" 开头，使用中文，控制在 1-3 句。
+        可包含词根联想、谐音、场景联想或词形/变位记忆提示；如果没有相关信息就给出通用记忆技巧。
+        """
+        let user = """
+        词条：\(word.spanish)
+        释义：\(word.meaningText)
+        词性：\(word.partOfSpeech.rawValue)
+        是否动词：\(word.isVerb ? "是" : "否")
+        动词变位：\(conjugation)
+        名词复数：\(nounPlural)
+        形容词形式：\(adjectiveForms)
+        输出语言：\(languageCode)
         """
         return (system, user)
     }

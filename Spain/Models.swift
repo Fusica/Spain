@@ -102,6 +102,7 @@ struct WordEntry: Identifiable, Codable, Hashable {
     var nextReviewDate: Date
     var lastReviewedAt: Date?
     var meaningLanguage: MeaningLanguage
+    var memoryTips: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -117,6 +118,7 @@ struct WordEntry: Identifiable, Codable, Hashable {
         case nextReviewDate
         case lastReviewedAt
         case meaningLanguage
+        case memoryTips
     }
 
     init(
@@ -131,7 +133,8 @@ struct WordEntry: Identifiable, Codable, Hashable {
         reviewStage: Int,
         nextReviewDate: Date,
         lastReviewedAt: Date? = nil,
-        meaningLanguage: MeaningLanguage = .chinese
+        meaningLanguage: MeaningLanguage = .chinese,
+        memoryTips: String? = nil
     ) {
         self.id = id
         self.spanish = spanish
@@ -146,6 +149,7 @@ struct WordEntry: Identifiable, Codable, Hashable {
         self.nextReviewDate = nextReviewDate
         self.lastReviewedAt = lastReviewedAt
         self.meaningLanguage = meaningLanguage
+        self.memoryTips = memoryTips
     }
 
     init(from decoder: Decoder) throws {
@@ -168,6 +172,7 @@ struct WordEntry: Identifiable, Codable, Hashable {
             lastReviewedAt = createdAt
         }
         meaningLanguage = try container.decodeIfPresent(MeaningLanguage.self, forKey: .meaningLanguage) ?? .chinese
+        memoryTips = try container.decodeIfPresent(String.self, forKey: .memoryTips)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -185,6 +190,7 @@ struct WordEntry: Identifiable, Codable, Hashable {
         try container.encode(nextReviewDate, forKey: .nextReviewDate)
         try container.encodeIfPresent(lastReviewedAt, forKey: .lastReviewedAt)
         try container.encode(meaningLanguage, forKey: .meaningLanguage)
+        try container.encodeIfPresent(memoryTips, forKey: .memoryTips)
     }
 }
 
@@ -293,15 +299,15 @@ extension WordEntry {
 }
 
 enum ReviewSchedule {
-    static let intervals: [TimeInterval] = [
-        24 * 60 * 60,
-        3 * 24 * 60 * 60,
-        7 * 24 * 60 * 60,
-        30 * 24 * 60 * 60
-    ]
+    static let dayIntervals: [Int] = [1, 3, 7, 30]
 
     static func nextDate(from now: Date, stage: Int) -> Date {
-        let safeStage = min(max(stage, 0), intervals.count - 1)
-        return now.addingTimeInterval(intervals[safeStage])
+        let safeStage = min(max(stage, 0), dayIntervals.count - 1)
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: now)
+        if let nextDate = calendar.date(byAdding: .day, value: dayIntervals[safeStage], to: startOfDay) {
+            return nextDate
+        }
+        return now.addingTimeInterval(TimeInterval(dayIntervals[safeStage] * 24 * 60 * 60))
     }
 }

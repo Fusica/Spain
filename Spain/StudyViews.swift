@@ -118,6 +118,7 @@ struct StudySessionView: View {
     @State private var dictationInput = ""
     @State private var showFeedback = false
     @State private var wasCorrect = false
+    @State private var tipsLoadingIds: Set<UUID> = []
 
     private var currentWordIndex: Int? {
         guard !sessionWords.isEmpty else { return nil }
@@ -133,11 +134,15 @@ struct StudySessionView: View {
 
     private var currentWord: WordEntry? {
         guard let index = currentWordIndex else { return nil }
-        return sessionWords[index]
+        return resolvedWord(for: sessionWords[index])
     }
 
     private var completedCount: Int {
         sessionWords.filter { progress[$0.id, default: 0] >= StudyRound.totalRounds }.count
+    }
+
+    private func resolvedWord(for entry: WordEntry) -> WordEntry {
+        store.words.first { $0.id == entry.id } ?? entry
     }
 
     private var primaryTextColor: Color {
@@ -189,6 +194,32 @@ struct StudySessionView: View {
                                 VStack(spacing: 12) {
                                     ForEach(question.choices, id: \.self) { choice in
                                         let isPending = pendingChoice == choice && !showFeedback
+                                        let isSelected = selectedChoice == choice
+                                        let isCorrectChoice = choice == question.correctAnswer
+                                        let fillColor: Color = {
+                                            if showFeedback {
+                                                if isCorrectChoice {
+                                                    return Color.green.opacity(0.25)
+                                                }
+                                                if isSelected {
+                                                    return Color.red.opacity(0.25)
+                                                }
+                                                return Color(.secondarySystemFill)
+                                            }
+                                            return isPending ? Color.blue.opacity(0.28) : Color(.secondarySystemFill)
+                                        }()
+                                        let strokeColor: Color = {
+                                            if showFeedback {
+                                                if isCorrectChoice {
+                                                    return Color.green.opacity(0.8)
+                                                }
+                                                if isSelected {
+                                                    return Color.red.opacity(0.8)
+                                                }
+                                                return Color.clear
+                                            }
+                                            return isPending ? Color.blue.opacity(0.6) : Color.clear
+                                        }()
                                         Button {
                                             pendingChoice = choice
                                         } label: {
@@ -203,28 +234,22 @@ struct StudySessionView: View {
                                                 }
                                             }
                                             .frame(maxWidth: .infinity, alignment: .center)
-                                            .overlay(alignment: .trailing) {
-                                                if showFeedback, let selectedChoice, selectedChoice == choice {
-                                                    Image(systemName: wasCorrect ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                                        .foregroundStyle(wasCorrect ? .green : .red)
-                                                }
-                                            }
                                             .padding(.vertical, 12)
                                             .padding(.horizontal, 12)
                                             .background(
                                                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                                    .fill(isPending ? Color.blue.opacity(0.28) : Color(.secondarySystemFill))
+                                                    .fill(fillColor)
                                             )
                                             .overlay(
                                                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                                    .stroke(isPending ? Color.blue.opacity(0.6) : Color.clear, lineWidth: 1)
+                                                    .stroke(strokeColor, lineWidth: 1)
                                             )
                                         }
                                         .buttonStyle(.plain)
                                         .disabled(showFeedback)
                                     }
                                     if showFeedback {
-                                        feedbackView(question: question)
+                                        feedbackContainer(question: question)
                                     }
                                     Spacer(minLength: 12)
                                     Button(showFeedback ? "继续" : "确定") {
@@ -238,10 +263,30 @@ struct StudySessionView: View {
                                 VStack(spacing: 12) {
                                     TextField(question.subject == nil ? "输入完整答案" : "输入动词变位", text: $dictationInput)
                                         .textInputAutocapitalization(.never)
-                                        .textFieldStyle(.roundedBorder)
+                                        .padding(.vertical, 10)
+                                        .padding(.horizontal, 12)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .fill(showFeedback ? (wasCorrect ? Color.green.opacity(0.2) : Color.red.opacity(0.2)) : Color(.secondarySystemFill))
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .stroke(showFeedback ? (wasCorrect ? Color.green : Color.red) : Color.clear, lineWidth: 1)
+                                        )
                                         .disabled(showFeedback)
                                         .font(.title2)
                                         .foregroundStyle(primaryTextColor)
+                                    if showFeedback && !wasCorrect {
+                                        HStack(spacing: 6) {
+                                            Text(dictationInput)
+                                                .strikethrough(true, color: .red)
+                                                .foregroundStyle(.red)
+                                            Text(question.correctAnswer)
+                                                .foregroundStyle(.green)
+                                        }
+                                        .font(.body)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
                                     Button("提交") {
                                         handleDictation()
                                     }
@@ -253,7 +298,7 @@ struct StudySessionView: View {
                             if showFeedback {
                                 if !question.round.isMultipleChoice {
                                     VStack(spacing: 8) {
-                                        feedbackView(question: question)
+                                        feedbackContainer(question: question)
                                         Button("继续") {
                                             advanceAfterFeedback()
                                         }
@@ -290,6 +335,7 @@ struct StudySessionView: View {
                 }
             }
             .navigationTitle(currentWord == nil ? "完成" : "背诵中")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if currentWord != nil {
                     ToolbarItem(placement: .cancellationAction) {
@@ -325,6 +371,7 @@ struct StudySessionView: View {
         selectedChoice = pendingChoice
         wasCorrect = (pendingChoice == question.correctAnswer)
         showFeedback = true
+        loadTipsIfNeeded()
     }
 
     private func confirmOrContinue() {
@@ -336,22 +383,58 @@ struct StudySessionView: View {
     }
 
     @ViewBuilder
+    private func feedbackContainer(question: StudyQuestion) -> some View {
+        ScrollView {
+            feedbackView(question: question)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 220, alignment: .top)
+        .scrollIndicators(.visible)
+        .contentShape(Rectangle())
+    }
+
     private func feedbackView(question: StudyQuestion) -> some View {
         VStack(spacing: 8) {
-            Text(wasCorrect ? "回答正确" : "回答错误")
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(wasCorrect ? .green : .red)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text("正确答案：")
-                    .font(.title2)
-                    .foregroundStyle(secondaryTextColor)
-                if question.round == .spanishToChinese, let word = currentWord {
-                    MeaningText(text: question.correctAnswer, language: word.meaningLanguage, style: .title2)
+            if let word = currentWord {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text("西语：")
+                            .font(.body)
+                            .foregroundStyle(secondaryTextColor)
+                        Text(word.spanish)
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(secondaryTextColor)
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text("\(word.meaningLabel)：")
+                            .font(.body)
+                            .foregroundStyle(secondaryTextColor)
+                        MeaningText(text: word.meaningText, language: word.meaningLanguage, style: .body)
+                            .foregroundStyle(secondaryTextColor)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let word = currentWord {
+                if let tips = word.memoryTips?.trimmed, !tips.isEmpty {
+                    Text(tips)
+                        .font(.body)
                         .foregroundStyle(secondaryTextColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if tipsLoadingIds.contains(word.id) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在生成记忆技巧...")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    Text(question.correctAnswer)
-                        .font(.title2)
+                    Text("暂无记忆技巧。")
+                        .font(.body)
                         .foregroundStyle(secondaryTextColor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             if !wasCorrect {
@@ -368,6 +451,43 @@ struct StudySessionView: View {
         let normalizedAnswer = question.correctAnswer.normalizedAnswer
         wasCorrect = (normalizedInput == normalizedAnswer)
         showFeedback = true
+        loadTipsIfNeeded()
+    }
+
+    private func loadTipsIfNeeded() {
+        guard let word = currentWord else { return }
+        if let tips = word.memoryTips?.trimmed, !tips.isEmpty { return }
+        if tipsLoadingIds.contains(word.id) { return }
+        tipsLoadingIds.insert(word.id)
+        Task {
+            do {
+                let tips = try await QwenService.shared.generateTips(for: word)
+                let normalized = normalizeTips(tips.tips)
+                _ = await MainActor.run {
+                    tipsLoadingIds.remove(word.id)
+                    if !normalized.isEmpty {
+                        store.updateTips(for: word.id, tips: normalized)
+                    }
+                }
+            } catch {
+                _ = await MainActor.run {
+                    tipsLoadingIds.remove(word.id)
+                }
+            }
+        }
+    }
+
+    private func normalizeTips(_ text: String) -> String {
+        let trimmed = text.trimmed
+        guard !trimmed.isEmpty else { return "" }
+        let lowercased = trimmed.lowercased()
+        if lowercased.hasPrefix("tips") {
+            let remainder = trimmed.dropFirst(4)
+            let content = remainder.drop(while: { $0 == ":" || $0 == "：" || $0 == " " })
+            let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized.isEmpty ? "Tips:" : "Tips: \(normalized)"
+        }
+        return "Tips: \(trimmed)"
     }
 
     private func advanceAfterFeedback() {
